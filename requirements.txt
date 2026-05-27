@@ -4,3 +4,4 @@ openpyxl
 anthropic
 json-repair
 docx2pdf
+openai

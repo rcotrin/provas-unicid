@@ -56,6 +56,7 @@ from io import BytesIO
 from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from docx.shared import Cm
 from datetime import datetime
 import openpyxl
 import re
@@ -88,6 +89,14 @@ try:
     ANTHROPIC_DISPONIVEL = True
 except ImportError:
     ANTHROPIC_DISPONIVEL = False
+
+# Integração com OpenAI DALL-E — opcional
+try:
+    from openai import OpenAI as _OpenAI
+    import base64 as _base64
+    OPENAI_DISPONIVEL = True
+except ImportError:
+    OPENAI_DISPONIVEL = False
 
 # Reparador de JSON malformado (aspas/quebras de linha dentro de strings)
 try:
@@ -175,8 +184,8 @@ def parse_markdown_segments(text):
 def docx_bytes_to_pdf_bytes(docx_bytes):
     """
     Converte bytes DOCX em bytes PDF.
-    - Linux: LibreOffice headless via subprocess.
-    - Windows/Mac: docx2pdf (requer Microsoft Word).
+    - Linux: LibreOffice headless via subprocess (Streamlit Cloud).
+    - Windows/Mac: docx2pdf via Microsoft Word.
     Retorna (pdf_bytes, None) em caso de sucesso ou (None, msg_erro) em falha.
     """
     if not PDF_DISPONIVEL:
@@ -405,6 +414,100 @@ def _chamar_api_claude(prompt, api_key, max_tokens=8192):
         return None, f"Erro na chamada à API: {e}"
 
 
+def _gerar_imagem_dalle(prompt, api_key_openai):
+    """
+    Gera uma imagem via gpt-image-1 e retorna (bytes_png, None) ou (None, erro).
+    Compatível com SDK openai >= 2.x (gpt-image-1) e >= 1.x (dall-e-3).
+    """
+    try:
+        import urllib.request as _urlreq
+        client = _OpenAI(api_key=api_key_openai)
+        response = client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            size="1024x1024",
+            quality="auto",
+            n=1,
+        )
+        data = response.data[0]
+        # gpt-image-1 retorna base64 diretamente em data.b64
+        if getattr(data, "b64", None):
+            return _base64.b64decode(data.b64), None
+        # dall-e-3 / fallback: b64_json
+        if getattr(data, "b64_json", None):
+            return _base64.b64decode(data.b64_json), None
+        # Fallback URL
+        if getattr(data, "url", None):
+            with _urlreq.urlopen(data.url) as r:
+                return r.read(), None
+        return None, "Nenhum dado de imagem na resposta da API."
+    except Exception as e:
+        return None, str(e)
+
+
+def _gerar_prompts_imagem_claude(questoes_obj, questoes_dis, api_key_claude):
+    """
+    Pede ao Claude um prompt DALL-E para cada questão aprovada.
+    Retorna (dict {enunciado: prompt_dalle}, None) ou (None, erro).
+    Claude decide se cada questão se beneficia de imagem; retorna null para as que não precisam.
+    """
+    lista_q = []
+    for i, q in enumerate(questoes_obj or [], start=1):
+        lista_q.append(f"OBJ {i}: {q[0][:300]}")
+    for i, q in enumerate(questoes_dis or [], start=1):
+        lista_q.append(f"DIS {i}: {q[:300]}")
+
+    if not lista_q:
+        return {}, None
+
+    questoes_txt = "\n".join(lista_q)
+
+    prompt = f"""Você é um especialista em criação de recursos visuais para provas universitárias.
+
+Para CADA questão abaixo, crie um prompt em INGLÊS para gerar uma imagem ilustrativa com DALL-E.
+A imagem deve representar visualmente o tema central da questão — pode ser um diagrama, infográfico, cena, objeto, processo ou conceito.
+TODAS as questões devem receber um prompt. Não use null.
+
+QUESTÕES:
+{questoes_txt}
+
+Retorne EXCLUSIVAMENTE um JSON válido com exatamente {len(lista_q)} itens:
+{{
+  "imagens": [
+    {{"enunciado_prefix": "OBJ 1", "prompt_dalle": "..." }},
+    {{"enunciado_prefix": "OBJ 2", "prompt_dalle": "..." }},
+    {{"enunciado_prefix": "DIS 1", "prompt_dalle": "..." }}
+  ]
+}}
+
+Regras para cada prompt DALL-E:
+- Escreva em inglês
+- Descreva uma cena ou diagrama visual claro e relevante para o tema da questão
+- Estilo sugerido: "educational illustration, clean design, white background, no text"
+- NÃO inclua texto, letras ou legendas na imagem gerada"""
+
+    resultado, erro = _chamar_api_claude(prompt, api_key_claude, max_tokens=2048)
+    if erro:
+        return None, erro
+
+    mapa = {}
+    todas_q = list(questoes_obj or []) + list(questoes_dis or [])
+    prefixos_obj = [f"OBJ {i}" for i in range(1, len(questoes_obj or []) + 1)]
+    prefixos_dis = [f"DIS {i}" for i in range(1, len(questoes_dis or []) + 1)]
+    prefixos = prefixos_obj + prefixos_dis
+
+    for item in resultado.get("imagens", []):
+        pref  = item.get("enunciado_prefix", "")
+        dalle = item.get("prompt_dalle")
+        if dalle and pref in prefixos:
+            idx = prefixos.index(pref)
+            if idx < len(todas_q):
+                enunciado = todas_q[idx][0] if isinstance(todas_q[idx], tuple) else todas_q[idx]
+                mapa[enunciado] = dalle
+
+    return mapa, None
+
+
 def _prompt_objetivas(texto, ja_aprovadas=None, n_faltando=None):
     """
     Prompt dedicado à EXTRAÇÃO de questões objetivas (múltipla escolha).
@@ -430,7 +533,7 @@ Extraia as questões de múltipla escolha presentes no documento abaixo.
 Dica de foco para esta extração: {variacao}
 {ctx}{qtd}
 REGRAS OBRIGATÓRIAS:
-1. Extraia as questões objetivas — percorra o documento inteiro sem parar.
+1. Extraia no máximo 10 questões objetivas — priorize as mais representativas do conteúdo.
 2. Para cada questão inclua: enunciado completo, resposta correta e EXATAMENTE 4 distratores.
 3. Se houver gabarito indicado (ex: 'Gabarito: B', 'Resposta: C'), use-o para identificar a correta.
 4. Retorne o TEXTO de cada alternativa, sem a letra (A, B, C...).
@@ -454,14 +557,14 @@ DOCUMENTO:
 {texto[:22000]}"""
 
 
-def _prompt_dissertativas(texto, temas_obj=None, ja_aprovadas=None, n_faltando=8):
+def _prompt_dissertativas(texto, temas_obj=None, ja_aprovadas=None, n_faltando=5):
     """
     Prompt dedicado à CRIAÇÃO de questões dissertativas com base nos temas do documento.
 
     Documentos de Google Forms tipicamente têm apenas múltipla escolha.
     Por isso este prompt instrui o modelo a CRIAR questões abertas adequadas
     para o nível universitário, baseando-se nos temas e conceitos identificados.
-    Gera um pool maior (padrão 8) para que random.sample() possa variar entre versões.
+    Gera um pool de até 5 questões (padrão) para seleção aleatória entre versões.
     Injeta uma instrução aleatória para variar a abordagem entre chamadas.
     """
     ctx_temas = ""
@@ -539,7 +642,7 @@ def processar_com_claude(texto, api_key, tipo_questoes="ambas"):
 
     if tipo_questoes in ("dissertativas", "ambas"):
         temas = resultado.get("objetivas") or []
-        prompt_dis = _prompt_dissertativas(texto, temas_obj=temas)  # usa n_faltando=8 (pool grande)
+        prompt_dis = _prompt_dissertativas(texto, temas_obj=temas)  # usa n_faltando=5
         res_dis, erro = _chamar_api_claude(prompt_dis, api_key)
         if erro:
             return None, erro
@@ -769,6 +872,33 @@ def _injetar_linhas_apos(para, n_linhas, font_size_pt=11):
         sp.set(qn("w:lineRule"), "exact")
 
 
+def _injetar_imagem_apos(document, para, img_bytes, largura_cm=6.0):
+    """
+    Insere um parágrafo centralizado com imagem imediatamente após 'para'.
+    Retorna o novo parágrafo (wrapper python-docx).
+    """
+    new_p_el = OxmlElement("w:p")
+    pPr = OxmlElement("w:pPr")
+    jc = OxmlElement("w:jc")
+    jc.set(qn("w:val"), "center")
+    pPr.append(jc)
+    new_p_el.append(pPr)
+    para._p.addnext(new_p_el)
+
+    # Localiza o wrapper Python para o elemento recém-inserido
+    new_para = None
+    for p in document.paragraphs:
+        if p._p is new_p_el:
+            new_para = p
+            break
+    if new_para is None:
+        return para
+
+    run = new_para.add_run()
+    run.add_picture(BytesIO(img_bytes), width=Cm(largura_cm))
+    return new_para
+
+
 # --- Funções de Lógica Central ---
 
 def replace_text_in_paragraph_runs(paragraph, old_text, new_text, bold_prefix=False):
@@ -900,9 +1030,10 @@ def all_paragraphs(document):
 def criar_prova(nome_prova, simbolo_rodape, qt_questoes, questoes_selecionadas):
     """
     Cria o conteúdo de uma prova (questões objetivas formatadas e gabarito).
-    Retorna (lista_de_textos_de_questões, string_gabarito).
+    Retorna (lista_de_textos_de_questões, string_gabarito, lista_enunciados).
     """
     lista_questoes = []
+    lista_enunciados = []
     gabarito = "GABARITO\n"
 
     for indice, questao_tupla in enumerate(questoes_selecionadas, start=1):
@@ -922,13 +1053,14 @@ def criar_prova(nome_prova, simbolo_rodape, qt_questoes, questoes_selecionadas):
                 posicao_resposta_correta = idx_exib
 
         lista_questoes.append(questao_texto_completo)
+        lista_enunciados.append(pergunta_texto)
 
         if posicao_resposta_correta != -1:
             gabarito += f"{indice}: {ABC[posicao_resposta_correta]}\n"
         else:
             gabarito += f"{indice}: ERRO (Resposta não identificada para '{pergunta_texto[:40]}...')\n"
 
-    return lista_questoes, gabarito
+    return lista_questoes, gabarito, lista_enunciados
 
 
 # --- Funções de I/O ---
@@ -936,9 +1068,11 @@ def criar_prova(nome_prova, simbolo_rodape, qt_questoes, questoes_selecionadas):
 def get_questoes_xlsx(uploaded_file):
     """
     Lê questões objetivas de um arquivo XLSX.
-    Espera: A=Enunciado, B=Resposta correta, C–F=Distratores.
+    Espera: A=Enunciado, B=Resposta correta, C–F=Distratores, G=Imagem (opcional).
+    Retorna (questoes, imagens_dict) onde imagens_dict = {enunciado: nome_arquivo}.
     """
     questoes = []
+    imagens = {}
     try:
         wb = openpyxl.load_workbook(uploaded_file, read_only=True, data_only=True)
         ws = wb.active
@@ -959,19 +1093,26 @@ def get_questoes_xlsx(uploaded_file):
                 continue
             alternativas = [resposta_correta] + distratores
             questoes.append((pergunta, resposta_correta, *alternativas))
+            # Coluna G (índice 6) — nome do arquivo de imagem (opcional)
+            if len(row) > 6 and row[6] is not None:
+                nome_img = str(row[6]).strip()
+                if nome_img:
+                    imagens[pergunta] = nome_img
         wb.close()
     except Exception as e:
         st.error(f"Erro ao ler questões objetivas: {e}")
-        return None
-    return questoes or None
+        return None, {}
+    return (questoes or None), imagens
 
 
 def get_questoes_dissertativas_xlsx(uploaded_file):
     """
-    Lê questões dissertativas de um arquivo XLSX.
-    Espera: A=Enunciado.
+    Lê questões discursivas de um arquivo XLSX.
+    Espera: A=Enunciado, B=Imagem (opcional).
+    Retorna (questoes, imagens_dict) onde imagens_dict = {enunciado: nome_arquivo}.
     """
     questoes = []
+    imagens = {}
     try:
         wb = openpyxl.load_workbook(uploaded_file, read_only=True, data_only=True)
         ws = wb.active
@@ -981,13 +1122,18 @@ def get_questoes_dissertativas_xlsx(uploaded_file):
             enunciado = str(row[0]).strip()
             if enunciado:
                 questoes.append(enunciado)
+                # Coluna B (índice 1) — nome do arquivo de imagem (opcional)
+                if len(row) > 1 and row[1] is not None:
+                    nome_img = str(row[1]).strip()
+                    if nome_img:
+                        imagens[enunciado] = nome_img
             else:
                 st.warning(f"Linha {i}: enunciado vazio. Ignorando.")
         wb.close()
     except Exception as e:
-        st.error(f"Erro ao ler questões dissertativas: {e}")
-        return None
-    return questoes or None
+        st.error(f"Erro ao ler questões discursivas: {e}")
+        return None, {}
+    return (questoes or None), imagens
 
 
 def _injetar_pontuacao_cabecalho(document, pontos_obj):
@@ -1023,7 +1169,7 @@ def _injetar_titulo_dissertativas(document, para_primeira_dis, pontos_dis):
         return
 
     para_sep = paragrafos[idx - 1]
-    texto = f"Questões Dissertativas = {pontos_dis}" if pontos_dis else "Questões Dissertativas"
+    texto = f"Questões Discursivas = {pontos_dis}" if pontos_dis else "Questões Discursivas"
 
     # Salva o sectPr que _separar_secao_dissertativas adicionou ao separador
     pPr_sep = para_sep._p.find(qn("w:pPr"))
@@ -1076,7 +1222,8 @@ def _injetar_titulo_dissertativas(document, para_primeira_dis, pontos_dis):
 def gera_prova_bytes(modelo_caminho, identificador_prova, questoes_formatadas,
                      simbolo_rodape, tipo_avaliacao, questoes_dissertativas=None,
                      professor="", disciplina="", linhas_por_questao=8,
-                     pontos_obj="", pontos_dis=""):
+                     pontos_obj="", pontos_dis="",
+                     imagens_questoes=None, enunciados_obj=None):
     """
     Preenche o template DOCX com as questões e retorna os bytes do arquivo gerado.
 
@@ -1095,15 +1242,24 @@ def gera_prova_bytes(modelo_caminho, identificador_prova, questoes_formatadas,
         _injetar_pontuacao_cabecalho(document, pontos_obj)
 
         # Substitui placeholders das questões objetivas
+        _enunciados = enunciados_obj or []
         for i, questao_texto in enumerate(questoes_formatadas, start=1):
             placeholder = f"{{{{Questão {i} aqui}}}}"
+            para_encontrado = None
             for paragraph in document.paragraphs:
                 if replace_text_in_paragraph_runs(paragraph, placeholder, questao_texto, bold_prefix=True):
+                    para_encontrado = paragraph
                     break
+            if para_encontrado and imagens_questoes and i <= len(_enunciados):
+                enunciado_i = _enunciados[i - 1]
+                if enunciado_i in imagens_questoes:
+                    _injetar_imagem_apos(document, para_encontrado,
+                                        imagens_questoes[enunciado_i], largura_cm=5.5)
 
-        # Substitui questões dissertativas e guarda referência a cada parágrafo
+        # Substitui questões discursivas e guarda referência a cada parágrafo
         _N_SLOTS_DIS = 3   # número de slots no template AR (questões 9, 10, 11)
-        paragrafos_dissertativos = []
+        paragrafos_dissertativos = []   # parágrafos do texto da questão (para título/seção)
+        paragrafos_ultimos_dis   = []   # último parágrafo por questão (questão ou imagem)
         if questoes_dissertativas:
             # Atualiza o valor por questão nos slots do template ANTES de preencher
             n_dis = len(questoes_dissertativas)
@@ -1121,6 +1277,13 @@ def gera_prova_bytes(modelo_caminho, identificador_prova, questoes_formatadas,
                 for paragraph in document.paragraphs:
                     if replace_text_in_paragraph_runs(paragraph, placeholder_diss, texto_diss, bold_prefix=True):
                         paragrafos_dissertativos.append(paragraph)
+                        last_para = paragraph
+                        if imagens_questoes and texto_diss in imagens_questoes:
+                            last_para = _injetar_imagem_apos(
+                                document, paragraph,
+                                imagens_questoes[texto_diss], largura_cm=5.5
+                            )
+                        paragrafos_ultimos_dis.append(last_para)
                         break
 
             # Limpa slots sobrando (quando há menos questões do que slots no template)
@@ -1132,15 +1295,15 @@ def gera_prova_bytes(modelo_caminho, identificador_prova, questoes_formatadas,
                         paragraph.clear()   # remove numeração e placeholder
                         break
 
-        # Separa as dissertativas para seção de 1 coluna (largura total)
+        # Separa as discursivas para seção de 1 coluna (largura total)
         if tipo_avaliacao == "R" and paragrafos_dissertativos:
             _separar_secao_dissertativas(document)
-            # Injeta cabeçalho "Questões Dissertativas [= Y pts]" sempre
+            # Injeta cabeçalho "Questões Discursivas [= Y pts]" sempre
             _injetar_titulo_dissertativas(document, paragrafos_dissertativos[0], pontos_dis)
 
-        # Injeta linhas de resposta após cada questão dissertativa
-        if paragrafos_dissertativos and linhas_por_questao > 0:
-            for dp in paragrafos_dissertativos:
+        # Injeta linhas de resposta após cada questão discursiva (ou após a imagem, se houver)
+        if paragrafos_ultimos_dis and linhas_por_questao > 0:
+            for dp in paragrafos_ultimos_dis:
                 _injetar_linhas_apos(dp, linhas_por_questao)
 
         # Substitui o símbolo da versão no rodapé
@@ -1229,7 +1392,7 @@ def _ui_importar_ia():
             "Formatos aceitos: **.docx** · **.xlsx** · **.txt** · **.gs** (Apps Script) · **.json** (Google Forms API/export)."
         )
 
-        col_key, col_tipo = st.columns([2, 1])
+        col_key, col_openai, col_tipo = st.columns([2, 2, 1])
         with col_key:
             api_key_input = st.text_input(
                 "Chave API Anthropic",
@@ -1238,10 +1401,24 @@ def _ui_importar_ia():
                 key=f"api_key_widget_{st.session_state['api_key_run_id']}",
                 help="Usada somente nesta chamada. Apagada automaticamente após o processamento.",
             )
+        with col_openai:
+            openai_key_input = st.text_input(
+                "Chave API OpenAI (DALL-E)",
+                type="password",
+                placeholder="sk-...",
+                key=f"openai_key_widget_{st.session_state['api_key_run_id']}",
+                help="Opcional. Necessária para sugerir e gerar imagens com DALL-E 3.",
+            )
+
+        # Persiste ambas as chaves na sessão enquanto o usuário as digitar
+        if api_key_input.strip():
+            st.session_state["anthropic_key_salva"] = api_key_input.strip()
+        if openai_key_input.strip():
+            st.session_state["openai_key_salva"] = openai_key_input.strip()
         with col_tipo:
             tipo_extracao = st.selectbox(
                 "Extrair",
-                ["Ambas (objetivas + dissertativas)", "Apenas objetivas", "Apenas dissertativas"],
+                ["Ambas (objetivas + discursivas)", "Apenas objetivas", "Apenas discursivas"],
                 key="tipo_extracao_ia",
             )
 
@@ -1273,15 +1450,15 @@ def _ui_importar_ia():
             elif arquivo_ia is None:
                 st.error("Carregue um documento antes de processar.")
             else:
-                with st.spinner("Extraindo objetivas e criando dissertativas — podem ser 2 chamadas à API..."):
+                with st.spinner("Extraindo objetivas e criando discursivas — podem ser 2 chamadas à API..."):
                     texto, erro_texto = extrair_texto_arquivo(arquivo_ia)
                     if erro_texto:
                         st.error(f"Erro ao ler arquivo: {erro_texto}")
                     else:
                         tipo_map = {
-                            "Ambas (objetivas + dissertativas)": "ambas",
+                            "Ambas (objetivas + discursivas)": "ambas",
                             "Apenas objetivas": "objetivas",
-                            "Apenas dissertativas": "dissertativas",
+                            "Apenas discursivas": "dissertativas",
                         }
                         resultado, erro_api = processar_com_claude(
                             texto, api_key_input.strip(), tipo_map[tipo_extracao],
@@ -1299,7 +1476,7 @@ def _ui_importar_ia():
                             st.session_state["ia_confirmadas"] = False
                             st.session_state["ia_msg_sucesso"] = (
                                 f"Extracao concluida: **{len(obj)}** objetiva(s) · "
-                                f"**{len(dis)}** dissertativa(s).  \n"
+                                f"**{len(dis)}** discursiva(s).  \n"
                                 "Revise abaixo, aprove cada questao e clique em **Usar questoes aprovadas**."
                             )
                             st.session_state["api_key_run_id"] += 1
@@ -1326,11 +1503,11 @@ def _ui_importar_ia():
                 st.error("Texto do documento nao disponivel. Reprocesse o arquivo.")
             else:
                 tipo_map = {
-                    "Ambas (objetivas + dissertativas)": "ambas",
+                    "Ambas (objetivas + discursivas)": "ambas",
                     "Apenas objetivas": "objetivas",
-                    "Apenas dissertativas": "dissertativas",
+                    "Apenas discursivas": "dissertativas",
                 }
-                with st.spinner(f"Regenerando {n_obj_falt} objetiva(s) e {n_dis_falt} dissertativa(s)..."):
+                with st.spinner(f"Regenerando {n_obj_falt} objetiva(s) e {n_dis_falt} discursiva(s)..."):
                     resultado, erro_api = regenerar_nao_confirmadas(
                         texto_doc, api_key_input.strip(), tipo_map[tipo_extracao],
                         obj_conf, dis_conf, n_obj_falt, n_dis_falt,
@@ -1367,7 +1544,7 @@ def _ui_importar_ia():
                         st.session_state["api_key_run_id"] += 1
                         st.session_state["ia_msg_sucesso"] = (
                             f"Regeneracao concluida: {slot_obj} objetiva(s) e "
-                            f"{slot_dis} dissertativa(s) substituidas. Revise abaixo."
+                            f"{slot_dis} discursiva(s) substituidas. Revise abaixo."
                         )
                         st.rerun()
 
@@ -1421,7 +1598,7 @@ def _ui_importar_ia():
                 if len(gab_prev) != len(dis_prev):
                     gab_prev = [""] * len(dis_prev)
 
-                st.markdown("**Questoes Dissertativas**")
+                st.markdown("**Questoes Discursivas**")
                 for i, q in enumerate(dis_prev):
                     with st.container(border=True):
                         c_icon, c_texto, c_btn = st.columns([0.08, 0.80, 0.12])
@@ -1441,6 +1618,136 @@ def _ui_importar_ia():
                                 st.session_state["ia_dis_ok"][i] = not dis_ok[i]
                                 st.rerun()
 
+            # --- Painel de imagens DALL-E ---
+            st.divider()
+            _openai_key_atual   = st.session_state.get("openai_key_salva", "")
+            _anthropic_key_img  = st.session_state.get("anthropic_key_salva", "")
+
+            with st.expander("Imagens com DALL-E 3 (opcional)", expanded=bool(st.session_state.get("ia_imgs_preview") or st.session_state.get("ia_imgs_prompts"))):
+                st.caption(
+                    "**Passo 1** — Claude sugere quais questões se beneficiam de imagem e gera os prompts.  \n"
+                    "**Passo 2** — DALL-E 3 gera cada imagem. Você pode regenerar sem repetir o Passo 1."
+                )
+
+                if not OPENAI_DISPONIVEL:
+                    st.warning("Pacote `openai` não instalado. Execute: `pip install openai`")
+                else:
+                    _obj_aprov_img = [q for q, ok in zip(obj_prev, obj_ok) if ok]
+                    _dis_aprov_img = [q for q, ok in zip(dis_prev, dis_ok) if ok]
+                    _n_aprov_img   = len(_obj_aprov_img) + len(_dis_aprov_img)
+                    _prompts_salvos = st.session_state.get("ia_imgs_prompts", {})
+                    _preview_atual  = st.session_state.get("ia_imgs_preview", {})
+                    _erros_salvos   = st.session_state.get("ia_imgs_erros", {})   # {enunc: True}
+                    _n_com_erro     = len(_erros_salvos)
+
+                    # --- Passo 1: sugerir prompts com Claude ---
+                    col_p1, col_p2 = st.columns(2)
+                    with col_p1:
+                        _btn_sugerir = st.button(
+                            f"Passo 1 — Sugerir prompts ({_n_aprov_img} questões)",
+                            key="btn_sugerir_prompts",
+                            help="Requer chave Anthropic. Só precisa rodar uma vez.",
+                            disabled=not _anthropic_key_img,
+                        )
+                    with col_p2:
+                        _tem_prompts  = bool(_prompts_salvos)
+                        _n_pendentes  = sum(1 for e in _prompts_salvos if e not in _preview_atual or e in _erros_salvos)
+                        _label_p2 = (
+                            f"Passo 2 — Regenerar com falha ({_n_com_erro})" if _n_com_erro
+                            else f"Passo 2 — Gerar imagens ({len(_prompts_salvos)} prompts)"
+                        )
+                        _btn_gerar = st.button(
+                            _label_p2,
+                            key="btn_gerar_dalle",
+                            help="Usa os prompts já gerados no Passo 1. Requer chave OpenAI.",
+                            disabled=not (_tem_prompts and _openai_key_atual),
+                        )
+
+                    if not _anthropic_key_img and not _prompts_salvos:
+                        st.info("Insira a Chave API Anthropic e clique em Passo 1 para começar.")
+                    if not _openai_key_atual:
+                        st.info("Insira a Chave API OpenAI (DALL-E) acima para habilitar o Passo 2.")
+
+                    # Executa Passo 1
+                    if _btn_sugerir:
+                        with st.spinner("Claude gerando prompts de imagem para cada questão..."):
+                            try:
+                                _pm, _err_p = _gerar_prompts_imagem_claude(
+                                    _obj_aprov_img, _dis_aprov_img, _anthropic_key_img
+                                )
+                            except Exception as _ex_p1:
+                                _pm, _err_p = None, str(_ex_p1)
+                        if _err_p:
+                            st.error(f"Erro ao gerar prompts: {_err_p}")
+                        else:
+                            st.session_state["ia_imgs_prompts"] = _pm
+                            st.session_state["ia_imgs_erros"]   = {}  # limpa erros anteriores
+                            n_pm = len(_pm)
+                            st.success(f"{n_pm} prompt(s) gerado(s). Clique em **Passo 2** para criar as imagens.")
+                            st.rerun()
+
+                    # Executa Passo 2 (geração DALL-E) — só processa pendentes/com erro
+                    if _btn_gerar and _prompts_salvos and _openai_key_atual:
+                        _preview_novo  = dict(_preview_atual)
+                        _erros_novo    = {}
+                        _erros_msg_novo = {}
+                        _ok_imgs       = dict(st.session_state.get("ia_imgs_ok", {}))
+                        _pendentes = {
+                            e: p for e, p in _prompts_salvos.items()
+                            if e not in _preview_atual or e in _erros_salvos
+                        }
+                        _n_pend = len(_pendentes)
+                        if _n_pend == 0:
+                            st.info("Todas as imagens já foram geradas com sucesso.")
+                        else:
+                            _prog = st.progress(0, text=f"Gerando {_n_pend} imagem(ns) com DALL-E 3...")
+                            for _pi, (_enunc, _dalle_p) in enumerate(_pendentes.items()):
+                                _prog.progress((_pi + 1) / _n_pend,
+                                               text=f"Gerando imagem {_pi+1}/{_n_pend}...")
+                                _img_b, _err_i = _gerar_imagem_dalle(_dalle_p, _openai_key_atual)
+                                if _img_b:
+                                    _preview_novo[_enunc] = _img_b
+                                    _ok_imgs[_enunc] = _ok_imgs.get(_enunc, True)
+                                else:
+                                    _erros_novo[_enunc] = True
+                                    _erros_msg_novo[_enunc] = str(_err_i)
+                            _prog.empty()
+                            st.session_state["ia_imgs_preview"]  = _preview_novo
+                            st.session_state["ia_imgs_ok"]       = _ok_imgs
+                            st.session_state["ia_imgs_erros"]    = _erros_novo
+                            st.session_state["ia_imgs_erros_msg"] = _erros_msg_novo
+                            st.rerun()
+
+                    # Exibe erros persistentes
+                    _erros_msg_salvos = st.session_state.get("ia_imgs_erros_msg", {})
+                    if _erros_msg_salvos:
+                        for _enunc_err, _msg_err in _erros_msg_salvos.items():
+                            st.error(f"**Falha ao gerar imagem:** {_msg_err}  \n`Questão: {_enunc_err[:120]}`")
+
+                    # Galeria de prévia
+                    if _preview_atual:
+                        _ok_imgs_atual = st.session_state.get("ia_imgs_ok", {})
+                        n_geradas = len(_preview_atual)
+                        n_erros   = len(_erros_salvos)
+                        st.markdown(f"**{n_geradas} gerada(s)** · {n_erros} com falha — aprove ou rejeite cada imagem:")
+                        for _enunc_img, _img_b in _preview_atual.items():
+                            with st.container(border=True):
+                                c_img, c_info = st.columns([0.45, 0.55])
+                                with c_img:
+                                    st.image(_img_b, use_container_width=True)
+                                with c_info:
+                                    _aprovada = _ok_imgs_atual.get(_enunc_img, True)
+                                    st.markdown(
+                                        f"<span style='color:{'green' if _aprovada else 'red'};font-size:1.2rem'>"
+                                        f"{'✅ Aprovada' if _aprovada else '❌ Rejeitada'}</span>",
+                                        unsafe_allow_html=True,
+                                    )
+                                    st.caption(_enunc_img[:200])
+                                    _label_img = "Rejeitar" if _aprovada else "Aprovar"
+                                    if st.button(_label_img, key=f"tog_img_{hash(_enunc_img) % 99999}"):
+                                        st.session_state["ia_imgs_ok"][_enunc_img] = not _aprovada
+                                        st.rerun()
+
             st.divider()
             col_usar, col_limpar = st.columns(2)
             with col_usar:
@@ -1458,11 +1765,20 @@ def _ui_importar_ia():
                     st.session_state["ia_obj_ok"]  = [True] * len(st.session_state["ia_obj"])
                     st.session_state["ia_dis_ok"]  = [True] * len(st.session_state["ia_dis"])
                     st.session_state["ia_confirmadas"] = True
+                    # Salva imagens aprovadas: {enunciado: bytes}
+                    _prev = st.session_state.get("ia_imgs_preview", {})
+                    _ok_i = st.session_state.get("ia_imgs_ok", {})
+                    st.session_state["ia_imgs"] = {
+                        enunc: b for enunc, b in _prev.items() if _ok_i.get(enunc, True)
+                    }
                     st.rerun()
             with col_limpar:
                 if st.button("Descartar tudo", key="btn_limpar_ia"):
                     for k in ("ia_obj", "ia_dis", "ia_dis_gab", "ia_obj_ok",
-                              "ia_dis_ok", "ia_confirmadas", "ia_texto_doc"):
+                              "ia_dis_ok", "ia_confirmadas", "ia_texto_doc",
+                              "ia_imgs", "ia_imgs_preview", "ia_imgs_ok",
+                              "ia_imgs_prompts", "ia_imgs_erros",
+                              "openai_key_salva"):
                         if k in st.session_state:
                             del st.session_state[k]
                     st.rerun()
@@ -1471,7 +1787,7 @@ def _ui_importar_ia():
             n_obj = len(st.session_state.get("ia_obj", []))
             n_dis = len(st.session_state.get("ia_dis", []))
             st.success(
-                f"Questoes ativas via IA: **{n_obj}** objetiva(s) · **{n_dis}** dissertativa(s). "
+                f"Questoes ativas via IA: **{n_obj}** objetiva(s) · **{n_dis}** discursiva(s). "
                 "Pronto para gerar a prova."
             )
             # Dica de variedade: pool pequeno = mesmas questões em todas as versões
@@ -1483,7 +1799,7 @@ def _ui_importar_ia():
                 )
             if n_dis <= 2:
                 avisos.append(
-                    f"Dissertativas: pool de {n_dis} questão(ões) — sem variedade entre versões."
+                    f"Discursivas: pool de {n_dis} questão(ões) — sem variedade entre versões."
                     " Processe novamente para ampliar o pool."
                 )
             if avisos:
@@ -1567,7 +1883,7 @@ Indicado quando o professor já possui as questões organizadas em planilha.
 3. Ajuste o **Número de versões**.
 4. Preencha **Professor** e **Disciplina**.
 5. Faça upload da planilha de **questões objetivas** (`.xlsx`).
-6. Se AR: faça upload da planilha de **questões dissertativas** (`.xlsx`).
+6. Se AR: faça upload da planilha de **questões discursivas** (`.xlsx`).
 7. Configure pontuação, linhas de resposta e clique em **Gerar Provas**.
 
 **Formato — Questões Objetivas:**
@@ -1578,7 +1894,7 @@ Indicado quando o professor já possui as questões organizadas em planilha.
 | B | Resposta correta |
 | C–F | Distratores (4 alternativas incorretas) |
 
-**Formato — Questões Dissertativas:**
+**Formato — Questões Discursivas:**
 
 | Coluna | Conteúdo |
 |---|---|
@@ -1605,7 +1921,7 @@ Utiliza a API do **Claude AI (Anthropic)** para extrair e estruturar questões d
 
 **Passo a passo:**
 1. Insira sua **chave da API** (começa com `sk-ant-...`).
-2. Selecione o que extrair: **Ambas**, **Objetivas** ou **Dissertativas**.
+2. Selecione o que extrair: **Ambas**, **Objetivas** ou **Discursivas**.
 3. Faça upload do documento de origem.
 4. Clique em **Processar com IA**.
 """)
@@ -1637,13 +1953,13 @@ Use **Regenerar não confirmadas** para pedir uma nova tentativa só para as rej
 | **Tipo de gabarito** | Padrão ou Zipgrade (correção por leitura óptica) |
 | **Número de versões** | 1 a 8 (letras A–H) |
 | **Professor / Disciplina** | Inseridos no cabeçalho de todas as versões |
-| **Questões dissertativas** | Radio 2 ou 3 — calcula automaticamente o valor por questão |
-| **Linhas de resposta** | Slider 4–20 linhas por questão dissertativa |
+| **Questões discursivas** | Radio 2 ou 3 — calcula automaticamente o valor por questão |
+| **Linhas de resposta** | Slider 4–20 linhas por questão discursiva |
 | **Incluir PDF** | Requer Microsoft Word instalado |
 
 **Pontuação calculada automaticamente (AR):**
 - Objetivas: 8 × 0,25 pt = **2,00 pts** (fixo)
-- Dissertativas: 3,00 pts ÷ nº de questões = **1,00 pt** (3 dis) ou **1,50 pt** (2 dis)
+- Discursivas: 3,00 pts ÷ nº de questões = **1,00 pt** (3 dis) ou **1,50 pt** (2 dis)
 """)
 
     # 8. Geração e download
@@ -1658,7 +1974,7 @@ Após configurar, clique em **Gerar Provas**. O ZIP baixado contém:
 **Estrutura do DOCX:**
 - Cabeçalho com dados institucionais e identificador da versão.
 - Questões objetivas em **2 colunas**.
-- Quebra para nova página, questões dissertativas em **1 coluna** com linhas de resposta.
+- Quebra para nova página, questões discursivas em **1 coluna** com linhas de resposta.
 """)
 
     # 9. Dicas
@@ -1751,15 +2067,15 @@ def _ui_faq():
          uma nova chamada com custo adicional. Consulte [anthropic.com/pricing](https://anthropic.com/pricing)."""),
 
         ("Importação via IA",
-         "O que fazer se a IA não gerou questões dissertativas?",
-         """1. Verifique se **Extrair** está em "Ambas" ou "Dissertativas".
+         "O que fazer se a IA não gerou questões discursivas?",
+         """1. Verifique se **Extrair** está em "Ambas" ou "Discursivas".
          2. Tente **Regenerar não confirmadas**.
          3. Forneça um documento mais estruturado (enunciados numerados ou separados).
-         A IA **cria** as dissertativas a partir dos temas — o documento de origem não precisa tê-las."""),
+         A IA **cria** as discursivas a partir dos temas — o documento de origem não precisa tê-las."""),
 
         ("Importação via IA",
-         "Posso combinar IA para dissertativas e XLSX para objetivas?",
-         """Sim. Selecione **"Dissertativas"** no dropdown da IA, aprove as questões
+         "Posso combinar IA para discursivas e XLSX para objetivas?",
+         """Sim. Selecione **"Discursivas"** no dropdown da IA, aprove as questões
          e faça upload da planilha de objetivas normalmente. O sistema combina os dois."""),
 
         ("Configuração e Geração",
@@ -1800,7 +2116,7 @@ def _ui_faq():
          """Causas mais comuns:
          1. **Templates ausentes** — verifique os quatro `Modelo_*.docx` na pasta.
          2. **Planilha com formato incorreto** — confira as colunas (A=enunciado, B=correta, C-F=distratores).
-         3. **Questões insuficientes** — AR exige ≥8 obj + ≥2 dis; AF exige ≥20 obj.
+         3. **Questões insuficientes** — AR exige ≥8 obj + ≥2 disc; AF exige ≥20 obj.
          4. **Erro de API** — verifique a chave e o saldo na conta Anthropic.
          5. **Recarregue a página** no navegador (`F5`) e tente novamente."""),
 
@@ -1812,7 +2128,7 @@ def _ui_faq():
         ("Problemas",
          "Posso gerar Prova Final (AF) usando a IA?",
          """Sim. Selecione **AF**, use o dropdown da IA em "Objetivas" (ou "Ambas"),
-         aprove ao menos 20 questões objetivas. Para AF as dissertativas não são usadas."""),
+         aprove ao menos 20 questões objetivas. Para AF as discursivas não são usadas."""),
     ]
 
     secao_atual = ""
@@ -1883,7 +2199,7 @@ def main():
         st.caption("Aparece no cabeçalho de cada seção da prova. Deixe em branco para omitir.")
         if tipo_codigo == "R":
             qt_dissertativas = st.radio(
-                "Questões dissertativas",
+                "Questões discursivas",
                 [2, 3],
                 horizontal=True,
                 key="qt_dis_radio",
@@ -1892,8 +2208,8 @@ def main():
             _por_questao_fmt = f"{_val_dis:.2f}".replace(".", ",") + " pt"
             pontos_dis = "3,00 pts"   # total da seção — vai para o cabeçalho do DOCX
             st.caption(
-                f"Valor por questão dissertativa: **{_por_questao_fmt}** · "
-                f"Total dissertativas: **3,00 pts** · "
+                f"Valor por questão discursiva: **{_por_questao_fmt}** · "
+                f"Total discursivas: **3,00 pts** · "
                 f"Total objetivas: **2,00 pts** (8 × 0,25 pt)"
             )
         else:
@@ -1906,9 +2222,9 @@ def main():
         # 6. Espaço dissertativo (somente AR)
         linhas_por_questao = 8
         if tipo_codigo == "R":
-            st.subheader("Espaço de resposta dissertativa")
+            st.subheader("Espaço de resposta discursiva")
             st.caption(
-                "As dissertativas ocupam página inteira (1 coluna), iniciando sempre em "
+                "As discursivas ocupam página inteira (1 coluna), iniciando sempre em "
                 "página nova. As linhas abaixo são inseridas diretamente no DOCX."
             )
             linhas_por_questao = st.slider(
@@ -1919,19 +2235,19 @@ def main():
         st.divider()
 
         # 6. Opção de PDF
-        _pdf_help_on  = ("Converte cada DOCX para PDF via LibreOffice." if _SISTEMA == "Linux"
-                         else "Converte cada DOCX para PDF via Microsoft Word. Feche o Word antes de gerar.")
-        _pdf_help_off = ("Indisponível — LibreOffice não encontrado no servidor."
-                         if _SISTEMA == "Linux"
-                         else "Indisponível — instale: pip install docx2pdf (requer Microsoft Word)")
         gerar_pdf = st.checkbox(
             "Incluir PDF no download",
             value=False,
-            help=_pdf_help_on if PDF_DISPONIVEL else _pdf_help_off,
+            help=(
+                "Converte cada DOCX para PDF via Microsoft Word. "
+                "Feche o Word antes de gerar."
+                if PDF_DISPONIVEL
+                else "Indisponível — instale: pip install docx2pdf (requer Microsoft Word)"
+            ),
             disabled=not PDF_DISPONIVEL
         )
         if not PDF_DISPONIVEL:
-            st.caption(_pdf_help_off)
+            st.caption("Para habilitar PDF: `pip install docx2pdf` (requer Microsoft Word)")
 
     with col_dir:
         _usando_ia = st.session_state.get("ia_confirmadas", False)
@@ -1957,9 +2273,9 @@ def main():
         # 8. Upload de questões dissertativas (somente AR)
         arquivo_dissertativas = None
         if tipo_codigo == "R":
-            st.subheader("Questões dissertativas")
+            st.subheader("Questões discursivas")
             if _usando_ia and _ia_dis:
-                st.info(f"{len(_ia_dis)} questão(ões) dissertativa(s) carregada(s) via IA.")
+                st.info(f"{len(_ia_dis)} questão(ões) discursiva(s) carregada(s) via IA.")
             st.caption(
                 "Planilha XLSX: **coluna A** = enunciado.  \n"
                 "Primeira linha = primeira questão (sem cabeçalho).  \n"
@@ -1967,14 +2283,29 @@ def main():
                 + ("  \n_Upload opcional — questões da IA estão ativas._" if (_usando_ia and _ia_dis) else "")
             )
             arquivo_dissertativas = st.file_uploader(
-                "Carregar questões dissertativas (.xlsx)",
+                "Carregar questões discursivas (.xlsx)",
                 type=["xlsx"],
                 key="dissertativas"
             )
 
     st.divider()
 
-    # 9. Botão de geração
+    # 9. Imagens das questões (opcional)
+    arquivos_imagens = st.file_uploader(
+        "Imagens das questões (opcional)",
+        type=["png", "jpg", "jpeg", "gif", "bmp"],
+        accept_multiple_files=True,
+        key="imagens_questoes",
+        help=(
+            "Faça upload dos arquivos de imagem referenciados no XLSX.  \n"
+            "Objetivas: coluna G = nome do arquivo (ex: fig1.png).  \n"
+            "Discursivas: coluna B = nome do arquivo."
+        ),
+    )
+
+    st.divider()
+
+    # 10. Botão de geração
     gerar = st.button("Gerar Provas", type="primary", use_container_width=True)
 
     if gerar:
@@ -2003,7 +2334,7 @@ def main():
         )
         if tipo_codigo == "R" and not tem_dis:
             st.error(
-                "Carregue o arquivo de questões dissertativas ou importe via IA antes de continuar."
+                "Carregue o arquivo de questões discursivas ou importe via IA antes de continuar."
             )
             return
 
@@ -2017,9 +2348,16 @@ def main():
         # --- Geração ---
         with st.spinner("Lendo questões e gerando provas..."):
 
+            # Monta dict de imagens carregadas: {filename: bytes}
+            uploaded_images = {}
+            if arquivos_imagens:
+                for f_img in arquivos_imagens:
+                    uploaded_images[f_img.name] = f_img.getvalue()
+
             # Fonte das objetivas: XLSX tem prioridade; IA como fallback
+            imagens_obj = {}
             if arquivo_objetivas is not None:
-                questoes_objetivas = get_questoes_xlsx(arquivo_objetivas)
+                questoes_objetivas, imagens_obj = get_questoes_xlsx(arquivo_objetivas)
                 if not questoes_objetivas:
                     st.error("Nenhuma questão objetiva válida encontrada. Verifique o arquivo XLSX.")
                     return
@@ -2035,12 +2373,13 @@ def main():
 
             questoes_dissertativas   = None
             gabaritos_dissertativas  = None   # dict enunciado→resposta (só via IA)
+            imagens_dis = {}
             # qt_dissertativas vem da UI (radio 2 ou 3), já definido acima
             if tipo_codigo == "R":
                 if arquivo_dissertativas is not None:
-                    questoes_dissertativas = get_questoes_dissertativas_xlsx(arquivo_dissertativas)
+                    questoes_dissertativas, imagens_dis = get_questoes_dissertativas_xlsx(arquivo_dissertativas)
                     if not questoes_dissertativas:
-                        st.error("Nenhuma questão dissertativa válida. Verifique o arquivo XLSX.")
+                        st.error("Nenhuma questão discursiva válida. Verifique o arquivo XLSX.")
                         return
                 else:
                     questoes_dissertativas  = _ia_dis
@@ -2054,7 +2393,7 @@ def main():
 
                 if len(questoes_dissertativas) < qt_dissertativas:
                     st.error(
-                        f"São necessárias ao menos **{qt_dissertativas}** questões dissertativas, "
+                        f"São necessárias ao menos **{qt_dissertativas}** questões discursivas, "
                         f"mas foram encontradas apenas **{len(questoes_dissertativas)}**."
                     )
                     return
@@ -2065,13 +2404,23 @@ def main():
             erros      = []
             erros_pdf  = []
 
+            # Monta dict {enunciado: bytes} — combina XLSX + IA (XLSX tem prioridade)
+            imagens_mapa = {**imagens_obj, **imagens_dis}
+            imagens_xlsx = {
+                enunc: uploaded_images[fname]
+                for enunc, fname in imagens_mapa.items()
+                if fname in uploaded_images
+            } if uploaded_images else {}
+            imagens_ia = st.session_state.get("ia_imgs", {})
+            imagens_bytes = {**imagens_ia, **imagens_xlsx}  # XLSX sobrescreve IA
+
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 for i in range(qt_versoes):
                     nome_prova = LETRAS_PROVA[i]
                     simbolo    = SIMBOLOS_PROVA[nome_prova]
 
                     questoes_selecionadas = random.sample(questoes_objetivas, qt_questoes_objetivas)
-                    questoes_formatadas, gabarito_da_prova = criar_prova(
+                    questoes_formatadas, gabarito_da_prova, enunciados_obj = criar_prova(
                         nome_prova, simbolo, qt_questoes_objetivas, questoes_selecionadas
                     )
 
@@ -2095,6 +2444,8 @@ def main():
                         linhas_por_questao=linhas_por_questao,
                         pontos_obj=pontos_obj.strip(),
                         pontos_dis=pontos_dis,
+                        imagens_questoes=imagens_bytes or None,
+                        enunciados_obj=enunciados_obj,
                     )
 
                     if prova_bytes:
@@ -2125,13 +2476,10 @@ def main():
             versoes_com_erro = ", ".join(v for v, _ in erros_pdf)
             # Mostra o motivo real do primeiro erro (geralmente o mesmo para todos)
             msg_erro = erros_pdf[0][1] or "erro desconhecido"
-            _dica_pdf = ("Dica: verifique se o LibreOffice está instalado no servidor."
-                         if _SISTEMA == "Linux"
-                         else "Dica: feche o Microsoft Word completamente antes de gerar.")
             st.warning(
                 f"Conversão para PDF falhou nas versões: {versoes_com_erro}.  \n"
                 f"**Motivo:** {msg_erro}  \n"
-                f"{_dica_pdf}"
+                "Dica: feche o Microsoft Word completamente antes de gerar."
             )
 
         if not erros:
