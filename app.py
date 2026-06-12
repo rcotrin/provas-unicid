@@ -508,7 +508,7 @@ Regras para cada prompt DALL-E:
     return mapa, None
 
 
-def _prompt_objetivas(texto, ja_aprovadas=None, n_faltando=None):
+def _prompt_objetivas(texto, ja_aprovadas=None, n_faltando=None, max_obj=10):
     """
     Prompt dedicado à EXTRAÇÃO de questões objetivas (múltipla escolha).
     Usa apenas o conteúdo que já está no documento.
@@ -533,7 +533,7 @@ Extraia as questões de múltipla escolha presentes no documento abaixo.
 Dica de foco para esta extração: {variacao}
 {ctx}{qtd}
 REGRAS OBRIGATÓRIAS:
-1. Extraia no máximo 10 questões objetivas — priorize as mais representativas do conteúdo.
+1. Extraia no máximo {max_obj} questões objetivas — priorize as mais representativas do conteúdo.
 2. Para cada questão inclua: enunciado completo, resposta correta e EXATAMENTE 4 distratores.
 3. Se houver gabarito indicado (ex: 'Gabarito: B', 'Resposta: C'), use-o para identificar a correta.
 4. Retorne o TEXTO de cada alternativa, sem a letra (A, B, C...).
@@ -619,7 +619,7 @@ DOCUMENTO (banco de questões da disciplina):
 {texto[:22000]}"""
 
 
-def processar_com_claude(texto, api_key, tipo_questoes="ambas"):
+def processar_com_claude(texto, api_key, tipo_questoes="ambas", max_obj=10):
     """
     Processa o documento em até duas chamadas à API:
 
@@ -634,7 +634,7 @@ def processar_com_claude(texto, api_key, tipo_questoes="ambas"):
     resultado = {"objetivas": [], "dissertativas": []}
 
     if tipo_questoes in ("objetivas", "ambas"):
-        prompt_obj = _prompt_objetivas(texto)
+        prompt_obj = _prompt_objetivas(texto, max_obj=max_obj)
         res_obj, erro = _chamar_api_claude(prompt_obj, api_key)
         if erro:
             return None, erro
@@ -653,7 +653,7 @@ def processar_com_claude(texto, api_key, tipo_questoes="ambas"):
 
 def regenerar_nao_confirmadas(texto, api_key, tipo_questoes,
                                obj_confirmadas, dis_confirmadas,
-                               n_obj_faltando, n_dis_faltando):
+                               n_obj_faltando, n_dis_faltando, max_obj=10):
     """
     Regenera apenas as questões não confirmadas usando os prompts dedicados.
     Passa as já confirmadas como contexto para evitar repetição.
@@ -663,7 +663,7 @@ def regenerar_nao_confirmadas(texto, api_key, tipo_questoes,
 
     if n_obj_faltando > 0:
         prompt = _prompt_objetivas(texto, ja_aprovadas=obj_confirmadas,
-                                   n_faltando=n_obj_faltando)
+                                   n_faltando=n_obj_faltando, max_obj=max_obj)
         res, erro = _chamar_api_claude(prompt, api_key)
         if erro:
             return None, erro
@@ -1460,8 +1460,11 @@ def _ui_importar_ia():
                             "Apenas objetivas": "objetivas",
                             "Apenas discursivas": "dissertativas",
                         }
+                        _tipo_aval = st.session_state.get("tipo_avaliacao", "")
+                        _max_obj = 20 if ("Final" in _tipo_aval and tipo_extracao == "Apenas objetivas") else 10
                         resultado, erro_api = processar_com_claude(
                             texto, api_key_input.strip(), tipo_map[tipo_extracao],
+                            max_obj=_max_obj,
                         )
                         if erro_api:
                             st.error(f"Erro: {erro_api}")
@@ -1507,10 +1510,13 @@ def _ui_importar_ia():
                     "Apenas objetivas": "objetivas",
                     "Apenas discursivas": "dissertativas",
                 }
+                _tipo_aval = st.session_state.get("tipo_avaliacao", "")
+                _max_obj = 20 if ("Final" in _tipo_aval and tipo_extracao == "Apenas objetivas") else 10
                 with st.spinner(f"Regenerando {n_obj_falt} objetiva(s) e {n_dis_falt} discursiva(s)..."):
                     resultado, erro_api = regenerar_nao_confirmadas(
                         texto_doc, api_key_input.strip(), tipo_map[tipo_extracao],
                         obj_conf, dis_conf, n_obj_falt, n_dis_falt,
+                        max_obj=_max_obj,
                     )
                     if erro_api:
                         st.error(f"Erro: {erro_api}")
@@ -2167,7 +2173,8 @@ def main():
         tipo_label = st.radio(
             "Tipo de avaliação",
             ["Regimental — AR", "Final — AF  (20 objetivas)"],
-            horizontal=True
+            horizontal=True,
+            key="tipo_avaliacao",
         )
         tipo_codigo           = "R" if "Regimental" in tipo_label else "F"
         qt_questoes_objetivas = 8 if tipo_codigo == "R" else 20
